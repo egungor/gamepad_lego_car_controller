@@ -30,7 +30,8 @@
 
 #define DEBUG_BLE 0                      // 1: tüm BLE tarama sonuçlarını yazdır
 
-static const int      DEADZONE              = 8;      // % cinsinden
+static const int      DEADZONE              = 8;      // % cinsinden (merkez)
+static const int      OUTER_DEADZONE        = 3;      // % cinsinden (uç; bunun ötesi 100 sayılır)
 static const bool     INVERT_THROTTLE       = true;   // asukiaaa: yukarı = 0
 static const bool     INVERT_STEERING       = false;
 
@@ -103,8 +104,14 @@ volatile int  legoEncRc     = 0;
 // DURUM
 // ============================================================
 
-bool     armed           = false;
-bool     lightsOn        = true;
+// Sürüş modu (Y ile değiştirilir):
+//   STICK  : sol çubuk dikey = gaz, sol çubuk yatay = direksiyon
+//   TRIGGER: RT = ileri gaz, LT = geri gaz, sol çubuk yatay = direksiyon
+enum DriveMode { MODE_STICK, MODE_TRIGGER };
+
+bool      armed           = false;
+bool      lightsOn        = true;
+DriveMode driveMode       = MODE_STICK;
 uint32_t brakeUntil      = 0;
 uint32_t lastReconnectMs = 0;
 uint32_t lastOledMs      = 0;
@@ -133,20 +140,31 @@ struct EdgeButton {
   void reset() { prev = false; }
 };
 
-EdgeButton btnA, btnB, btnStart;
+EdgeButton btnA, btnB, btnY, btnStart;
 
-// 0..65535 (merkez ~32768) -> -100..100, ölü bölge + yeniden ölçekleme
+// 0..100 büyüklüğe iç ve dış ölü bölge uygula, 0..100'e yeniden ölçekle
+int applyDeadzones(int a) {
+  if (a < DEADZONE) return 0;
+  if (a >= 100 - OUTER_DEADZONE) return 100;
+  return map(a, DEADZONE, 100 - OUTER_DEADZONE, 0, 100);
+}
+
+// 0..65535 (merkez 32768) -> -100..100
 int axisToPercent(uint16_t raw, bool invert) {
   long centered = (long)raw - 32768L;
-  int p = (int)(centered * 100L / 32768L);
+  // Pozitif taraf 32767'de biter: ayrı bölen, yoksa uçta 100 yerine 99 çıkar
+  int p = (int)(centered * 100L / (centered >= 0 ? 32767L : 32768L));
   p = constrain(p, -100, 100);
   if (invert) p = -p;
 
-  int a = abs(p);
-  if (a < DEADZONE) return 0;
-
-  int scaled = map(a, DEADZONE, 100, 0, 100);
+  int scaled = applyDeadzones(abs(p));
   return p > 0 ? scaled : -scaled;
+}
+
+// 0..1023 tetik -> 0..100
+int triggerToPercent(uint16_t raw) {
+  int p = (int)((long)raw * 100L / XboxControllerNotificationParser::maxTrig);
+  return applyDeadzones(constrain(p, 0, 100));
 }
 
 void forceResend() {
@@ -506,7 +524,12 @@ void updateOled(bool xboxOk, uint32_t now) {
   snprintf(l2, sizeof(l2), "SPD:%4d", curThrottle);
   snprintf(l3, sizeof(l3), "STR:%4d", curSteering);
 
-  oledMessage(status, l2, l3, lightsOn ? "ISIK ACIK" : "ISIK KAPALI");
+  char l4[16];
+  snprintf(l4, sizeof(l4), "%s I:%s",
+           driveMode == MODE_STICK ? "CUBUK" : "TETIK",
+           lightsOn ? "ACK" : "KPL");
+
+  oledMessage(status, l2, l3, l4);
 }
 
 // ============================================================
@@ -585,17 +608,29 @@ void loop() {
       Serial.println("Xbox koptu -> stop");
       disarm(true);
     }
-    btnA.reset(); btnB.reset(); btnStart.reset();
+    btnA.reset(); btnB.reset(); btnY.reset(); btnStart.reset();
   } else {
     const auto& n = xboxController.xboxNotif;
-
-    throttle = axisToPercent(n.joyLVert, INVERT_THROTTLE);
-    steering = axisToPercent(n.joyLHori, INVERT_STEERING);
 
     bool bHeld = n.btnB;
     bool bEdge = btnB.rose(bHeld);
     bool startEdge = btnStart.rose(n.btnStart);
     bool aEdge = btnA.rose(n.btnA);
+    bool yEdge = btnY.rose(n.btnY);
+
+    // Mod değişimi: araç güvenlik için durdurulur, START ile yeniden arm edilir
+    if (yEdge) {
+      driveMode = (driveMode == MODE_STICK) ? MODE_TRIGGER : MODE_STICK;
+      Serial.printf("Mod: %s\n", driveMode == MODE_STICK ? "CUBUK" : "TETIK");
+      if (armed) disarm(false);
+    }
+
+    if (driveMode == MODE_STICK) {
+      throttle = axisToPercent(n.joyLVert, INVERT_THROTTLE);
+    } else {
+      throttle = triggerToPercent(n.trigRT) - triggerToPercent(n.trigLT);
+    }
+    steering = axisToPercent(n.joyLHori, INVERT_STEERING);
 
     // Acil stop: B basılı tutulduğu sürece arm edilemez
     if (bEdge) {
