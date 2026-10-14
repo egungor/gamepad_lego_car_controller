@@ -8,7 +8,8 @@
 //   - U8g2
 //
 // Bağlantı stratejisi:
-//   1) Açılışta, Xbox kütüphanesi başlamadan ÖNCE LEGO hub taranır ve
+//   1) Açılışta, Xbox kütüphanesi başlamadan ÖNCE LEGO hub adresi belirlenir:
+//      LEGO_HUB_MAC tanımlıysa o kullanılır, değilse hub taranır ve
 //      adresi RAM'de saklanır. Böylece global BLE scanner'ı Xbox
 //      kütüphanesiyle paylaşma sorunu yaşanmaz.
 //   2) Hub sonradan koparsa tarama yapılmaz; bilinen adrese doğrudan
@@ -27,12 +28,11 @@
 // AYARLAR
 // ============================================================
 
-#define DEBUG_BLE 0                       // 1: tüm BLE tarama sonuçlarını yazdır
+#define DEBUG_BLE 0                      // 1: tüm BLE tarama sonuçlarını yazdır
 
 static const int      DEADZONE              = 8;      // % cinsinden
 static const bool     INVERT_THROTTLE       = true;   // asukiaaa: yukarı = 0
 static const bool     INVERT_STEERING       = false;
-static const bool     USE_SECURE_CONNECTION = true;   // hub bonding istemiyorsa false yapın
 
 static const uint32_t SCAN_DURATION_MS      = 10000;
 static const uint32_t CONNECT_TIMEOUT_MS    = 5000;
@@ -73,12 +73,31 @@ static const char* LEGO_SERVICE_UUID        = "00001623-1212-EFDE-1623-785FEABCD
 static const char* LEGO_CHARACTERISTIC_UUID = "00001624-1212-EFDE-1623-785FEABCD123";
 static const char* LEGO_HUB_NAME            = "Technic Move";
 
-NimBLEClient*               legoClient         = nullptr;
-NimBLERemoteCharacteristic* legoCharacteristic = nullptr;
+// Hub'ın MAC adresi. ESP32-C3 taraması bu hub'ın adresini 00:00:00:00:00:00
+// olarak raporluyor (Windows'tan okunan gerçek adres aşağıda); bu yüzden
+// adres biliniyorsa tarama atlanıp doğrudan bağlanılır. "" ise taranır.
+static const char* LEGO_HUB_MAC             = "0c:4b:ee:f0:69:6b";
 
-NimBLEAddress  hubAddress;
+// Technic Move hub public 00:00:00:00:00:00 adresiyle yayın yapıyor.
+// NimBLEClient::connect() bu adresi "null" sayıp reddettiği için LEGO
+// bağlantısı doğrudan NimBLE host API'si (ble_gap_* / ble_gattc_*) ile kurulur.
+ble_addr_t     hubAddress;
 volatile bool  hubAddressKnown = false;
 volatile bool  legoConnected   = false;   // BLE callback'inden de yazılır
+
+volatile uint16_t legoConnHandle = BLE_HS_CONN_HANDLE_NONE;
+volatile uint16_t legoValHandle  = 0;     // 0x1624 karakteristiğinin değer handle'ı
+
+// Host görevindeki callback'lerle ana döngü arasında senkronizasyon
+volatile bool legoGapDone  = false;
+volatile int  legoGapRc    = 0;
+volatile bool legoDiscDone = false;
+volatile int  legoDiscRc   = 0;
+volatile uint16_t legoCccdHandle = 0;      // bildirim descriptor'ı (0x2902)
+volatile bool legoWriteDone = false;
+volatile int  legoWriteRc   = 0;
+volatile bool legoEncDone   = false;
+volatile int  legoEncRc     = 0;
 
 // ============================================================
 // DURUM
@@ -166,32 +185,124 @@ public:
 
     if (!nameMatch && !svcMatch) return;
 
-    hubAddress      = dev->getAddress();
+    hubAddress      = *dev->getAddress().getBase();
     hubAddressKnown = true;
-    Serial.printf("LEGO hub bulundu: %s\n", hubAddress.toString().c_str());
+    Serial.printf("LEGO hub bulundu: %s\n", dev->getAddress().toString().c_str());
     NimBLEDevice::getScan()->stop();
   }
 };
 
-class LegoClientCallbacks : public NimBLEClientCallbacks {
-public:
-  void onDisconnect(NimBLEClient* client, int reason) override {
-    // Sadece bayrak: client burada silinmez, loop() yeniden bağlanır.
-    legoConnected = false;
-    Serial.printf("LEGO hub baglantisi koptu (reason=%d)\n", reason);
-  }
-};
+LegoScanCallbacks legoScanCallbacks;
 
-LegoScanCallbacks   legoScanCallbacks;
-LegoClientCallbacks legoClientCallbacks;
+// LEGO bağlantısının GAP olayları (NimBLE host görevinde çalışır)
+int legoGapEvent(ble_gap_event* event, void* arg) {
+  switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+      legoGapRc = event->connect.status;
+      if (event->connect.status == 0) legoConnHandle = event->connect.conn_handle;
+      legoGapDone = true;
+      break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+      // Sadece bayrak: loop() yeniden bağlanır.
+      legoConnected  = false;
+      legoConnHandle = BLE_HS_CONN_HANDLE_NONE;
+      legoGapRc      = event->disconnect.reason;
+      legoGapDone    = true;
+      Serial.printf("LEGO hub baglantisi koptu (reason=0x%X %s)\n",
+                    event->disconnect.reason,
+                    NimBLEUtils::returnCodeToString(event->disconnect.reason));
+      break;
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+      legoEncRc   = event->enc_change.status;
+      legoEncDone = true;
+      break;
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+      // Hub eski bağı unuttuysa: kayıtlı bağı sil ve yeniden eşleş
+      ble_gap_conn_desc desc;
+      if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+        ble_store_util_delete_peer(&desc.peer_id_addr);
+      }
+      return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+#if DEBUG_BLE
+      // Hub'tan gelen bildirimler (hata mesajları vb. teşhis için)
+      uint8_t  buf[32];
+      uint16_t len = 0;
+      ble_hs_mbuf_to_flat(event->notify_rx.om, buf, sizeof(buf), &len);
+      Serial.print("LEGO <-");
+      for (uint16_t i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
+      Serial.println();
+#endif
+      break;
+    }
+
+    default:
+      break;
+  }
+  return 0;
+}
+
+// Karakteristik keşfi (UUID ile, tüm handle aralığında)
+// Değer handle'ından sonraki ilk CCCD'yi bul
+int legoDscDiscovered(uint16_t connHandle, const ble_gatt_error* error,
+                      uint16_t chrValHandle, const ble_gatt_dsc* dsc, void* arg) {
+  if (error->status == 0 && dsc != nullptr) {
+    if (legoCccdHandle == 0 && ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
+      legoCccdHandle = dsc->handle;
+    }
+  } else {
+    legoDiscRc   = (error->status == BLE_HS_EDONE) ? 0 : error->status;
+    legoDiscDone = true;
+  }
+  return 0;
+}
+
+int legoWriteResult(uint16_t connHandle, const ble_gatt_error* error,
+                    ble_gatt_attr* attr, void* arg) {
+  legoWriteRc   = error->status;
+  legoWriteDone = true;
+  return 0;
+}
+
+int legoChrDiscovered(uint16_t connHandle, const ble_gatt_error* error,
+                      const ble_gatt_chr* chr, void* arg) {
+  if (error->status == 0 && chr != nullptr) {
+    legoValHandle = chr->val_handle;
+  } else {
+    legoDiscRc   = (error->status == BLE_HS_EDONE) ? 0 : error->status;
+    legoDiscDone = true;
+  }
+  return 0;
+}
+
+// Host görevinden gelecek bayrağı bekle
+bool waitFlag(volatile bool& flag, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (!flag) {
+    if (millis() - start > timeoutMs) return false;
+    delay(5);
+  }
+  return true;
+}
 
 // ============================================================
 // LEGO KOMUTLARI
 // ============================================================
 
 bool legoSend(const uint8_t* data, size_t length) {
-  if (!legoConnected || legoCharacteristic == nullptr) return false;
-  return legoCharacteristic->writeValue(data, length, false);
+  if (!legoConnected || legoValHandle == 0) return false;
+  int rc = ble_gattc_write_no_rsp_flat(legoConnHandle, legoValHandle, data, length);
+#if DEBUG_BLE
+  Serial.printf("LEGO ->");
+  for (size_t i = 0; i < length; i++) Serial.printf(" %02X", data[i]);
+  Serial.printf("  rc=%d\n", rc);
+#endif
+  return rc == 0;
 }
 
 // Birleşik sürüş çerçevesi:
@@ -237,11 +348,9 @@ bool scanForHub() {
   scan->clearResults();
 
   Serial.println("LEGO hub taraniyor...");
-  if (!scan->start(SCAN_DURATION_MS, false)) {   // NimBLE 2.x: milisaniye
-    Serial.println("HATA: tarama baslatilamadi");
-    return false;
-  }
-  while (scan->isScanning()) delay(20);
+  // Bloklayan tarama: NimBLE host görevi sonuçları tamamen işleyene kadar
+  // (ya da callback stop() çağırana kadar) bekler.
+  scan->getResults(SCAN_DURATION_MS, false);   // NimBLE 2.x: milisaniye
   scan->clearResults();
 
   // Callback'i bırak; Xbox kütüphanesi kendi callback'ini kuracak.
@@ -251,50 +360,89 @@ bool scanForHub() {
 }
 
 void dropLegoLink() {
-  legoConnected      = false;
-  legoCharacteristic = nullptr;
-  if (legoClient != nullptr && legoClient->isConnected()) {
-    legoClient->disconnect();
+  legoConnected = false;
+  legoValHandle = 0;
+  if (legoConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+    ble_gap_terminate(legoConnHandle, BLE_ERR_REM_USER_CONN_TERM);
   }
 }
 
 bool connectToHub() {
   if (!hubAddressKnown) return false;
 
-  if (legoClient == nullptr) {
-    legoClient = NimBLEDevice::createClient();
-    if (legoClient == nullptr) {
-      Serial.println("HATA: BLE client olusturulamadi");
-      return false;
+  // Xbox kütüphanesi tarıyorsa bağlantı kurulamaz (BLE_HS_EBUSY)
+  if (NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->stop();
+
+  char addrStr[18];
+  const uint8_t* v = hubAddress.val;
+  snprintf(addrStr, sizeof(addrStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+           v[5], v[4], v[3], v[2], v[1], v[0]);
+  Serial.printf("LEGO hub'a baglaniliyor: %s\n", addrStr);
+
+  legoGapDone    = false;
+  legoValHandle  = 0;
+  legoConnHandle = BLE_HS_CONN_HANDLE_NONE;
+  int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &hubAddress, CONNECT_TIMEOUT_MS,
+                           nullptr, legoGapEvent, nullptr);
+  if (rc != 0) {
+    Serial.printf("Baglanti baslatilamadi (rc=%d %s)\n", rc, NimBLEUtils::returnCodeToString(rc));
+    return false;
+  }
+  if (!waitFlag(legoGapDone, CONNECT_TIMEOUT_MS + 1000)) {
+    ble_gap_conn_cancel();
+    Serial.println("Baglanti zaman asimi");
+    return false;
+  }
+  if (legoGapRc != 0 || legoConnHandle == BLE_HS_CONN_HANDLE_NONE) {
+    Serial.printf("Baglanti basarisiz (rc=%d %s)\n", (int)legoGapRc,
+                  NimBLEUtils::returnCodeToString(legoGapRc));
+    return false;
+  }
+
+  // Technic Move hub şifreli bağlantı ister: şifresiz yazmaları sessizce
+  // yok sayar, CCCD yazımını "Insufficient Encryption" ile reddeder.
+  // Eşleşme (just works + bonding) başlat ve tamamlanmasını bekle.
+  legoEncDone = false;
+  rc = ble_gap_security_initiate(legoConnHandle);
+  if (rc != 0 || !waitFlag(legoEncDone, 10000) || legoEncRc != 0) {
+    Serial.printf("Sifreleme basarisiz (rc=%d/%d %s)\n", rc, (int)legoEncRc,
+                  NimBLEUtils::returnCodeToString(legoEncRc));
+    // Kayıtlı bağ bozuksa bir sonraki denemede sıfırdan eşleşilsin
+    ble_store_util_delete_peer(&hubAddress);
+    dropLegoLink();
+    return false;
+  }
+  Serial.println("Baglanti sifrelendi");
+
+  static NimBLEUUID chrUuid(LEGO_CHARACTERISTIC_UUID);
+  legoDiscDone = false;
+  rc = ble_gattc_disc_chrs_by_uuid(legoConnHandle, 1, 0xFFFF, chrUuid.getBase(),
+                                   legoChrDiscovered, nullptr);
+  if (rc != 0 || !waitFlag(legoDiscDone, 5000) || legoDiscRc != 0 || legoValHandle == 0) {
+    Serial.printf("LEGO karakteristigi bulunamadi (rc=%d/%d)\n", rc, (int)legoDiscRc);
+    dropLegoLink();
+    return false;
+  }
+
+  Serial.printf("LWP deger handle=%u\n", (unsigned)legoValHandle);
+
+  // LEGO uygulaması gibi bildirimlere abone ol: CCCD'yi keşfet ve 0x0001 yaz
+  legoCccdHandle = 0;
+  legoDiscDone   = false;
+  rc = ble_gattc_disc_all_dscs(legoConnHandle, legoValHandle, 0xFFFF,
+                               legoDscDiscovered, nullptr);
+  if (rc != 0 || !waitFlag(legoDiscDone, 5000) || legoCccdHandle == 0) {
+    Serial.printf("Uyari: CCCD bulunamadi (rc=%d/%d)\n", rc, (int)legoDiscRc);
+  } else {
+    const uint8_t notifyOn[] = { 0x01, 0x00 };
+    legoWriteDone = false;
+    rc = ble_gattc_write_flat(legoConnHandle, legoCccdHandle, notifyOn, sizeof(notifyOn),
+                              legoWriteResult, nullptr);
+    if (rc != 0 || !waitFlag(legoWriteDone, 3000) || legoWriteRc != 0) {
+      Serial.printf("Uyari: bildirim aboneligi basarisiz (rc=%d/%d)\n", rc, (int)legoWriteRc);
+    } else {
+      Serial.printf("Bildirimler acik (CCCD handle=%u)\n", (unsigned)legoCccdHandle);
     }
-    legoClient->setClientCallbacks(&legoClientCallbacks, false);
-    legoClient->setConnectTimeout(CONNECT_TIMEOUT_MS);   // NimBLE 2.x: milisaniye
-  }
-
-  Serial.printf("LEGO hub'a baglaniliyor: %s\n", hubAddress.toString().c_str());
-  if (!legoClient->connect(hubAddress)) {
-    Serial.println("Baglanti basarisiz");
-    return false;
-  }
-
-  if (USE_SECURE_CONNECTION && !legoClient->secureConnection()) {
-    Serial.println("Guvenli baglanti basarisiz");
-    dropLegoLink();
-    return false;
-  }
-
-  NimBLERemoteService* service = legoClient->getService(LEGO_SERVICE_UUID);
-  if (service == nullptr) {
-    Serial.println("LEGO servisi bulunamadi");
-    dropLegoLink();
-    return false;
-  }
-
-  legoCharacteristic = service->getCharacteristic(LEGO_CHARACTERISTIC_UUID);
-  if (legoCharacteristic == nullptr) {
-    Serial.println("LEGO karakteristigi bulunamadi");
-    dropLegoLink();
-    return false;
   }
 
   legoConnected = true;
@@ -382,6 +530,10 @@ void setup() {
   NimBLEDevice::setSecurityAuth(true, false, false);
 
   // 1) LEGO hub'ı bul (Xbox başlamadan önce, scanner çakışması olmasın)
+  if (LEGO_HUB_MAC[0] != '\0') {
+    hubAddress      = *NimBLEAddress(std::string(LEGO_HUB_MAC), BLE_ADDR_PUBLIC).getBase();
+    hubAddressKnown = true;
+  }
   int attempt = 0;
   while (!hubAddressKnown) {
     attempt++;
