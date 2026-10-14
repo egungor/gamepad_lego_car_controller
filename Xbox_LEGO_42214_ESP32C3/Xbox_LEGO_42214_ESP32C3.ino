@@ -1,11 +1,53 @@
+// ============================================================
+// Xbox Series X|S kumanda -> ESP32-C3 -> LEGO Technic Move Hub (88019)
+// Model: LEGO Technic 42214
+//
+// Gereksinimler:
+//   - NimBLE-Arduino 2.x  (tarama/timeout süreleri MİLİSANİYE)
+//   - XboxSeriesXControllerESP32_asukiaaa (NimBLE 2.x ile uyumlu sürüm)
+//   - U8g2
+//
+// Bağlantı stratejisi:
+//   1) Açılışta, Xbox kütüphanesi başlamadan ÖNCE LEGO hub taranır ve
+//      adresi RAM'de saklanır. Böylece global BLE scanner'ı Xbox
+//      kütüphanesiyle paylaşma sorunu yaşanmaz.
+//   2) Hub sonradan koparsa tarama yapılmaz; bilinen adrese doğrudan
+//      yeniden bağlanılır (Xbox kütüphanesinin scan callback'lerine
+//      dokunulmaz).
+// ============================================================
+
 #include <Arduino.h>
+#include <climits>
 #include <string>
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 
 // ============================================================
-// OLED
+// AYARLAR
+// ============================================================
+
+#define DEBUG_BLE 0                       // 1: tüm BLE tarama sonuçlarını yazdır
+
+static const int      DEADZONE              = 8;      // % cinsinden
+static const bool     INVERT_THROTTLE       = true;   // asukiaaa: yukarı = 0
+static const bool     INVERT_STEERING       = false;
+static const bool     USE_SECURE_CONNECTION = true;   // hub bonding istemiyorsa false yapın
+
+static const uint32_t SCAN_DURATION_MS      = 10000;
+static const uint32_t CONNECT_TIMEOUT_MS    = 5000;
+static const uint32_t RECONNECT_INTERVAL_MS = 2000;
+static const uint32_t KEEPALIVE_MS          = 150;    // değişmese de komutu tekrar gönder
+static const uint32_t OLED_INTERVAL_MS      = 100;
+static const uint32_t BRAKE_LIGHT_MS        = 1000;   // acil stop sonrası fren ışığı süresi
+
+// Işık byte değerleri (hub üzerinde doğrulayın)
+static const uint8_t LIGHTS_ON    = 0x00;
+static const uint8_t LIGHTS_OFF   = 0x04;
+static const uint8_t LIGHTS_BRAKE = 0x01;  // DOĞRULANMALI
+
+// ============================================================
+// OLED (72x40, SSD1306)
 // ============================================================
 
 U8G2_SSD1306_72X40_ER_F_HW_I2C oled(
@@ -19,373 +61,304 @@ U8G2_SSD1306_72X40_ER_F_HW_I2C oled(
 // XBOX
 // ============================================================
 
+// Kumandanın MAC adresini biliyorsanız hedefli bağlanmak için:
+// XboxSeriesXControllerESP32_asukiaaa::Core xboxController("xx:xx:xx:xx:xx:xx");
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 
 // ============================================================
-// LEGO MOVE HUB 88019
+// LEGO TECHNIC MOVE HUB 88019
 // ============================================================
 
-static const char* LEGO_SERVICE_UUID =
-  "00001623-1212-EFDE-1623-785FEABCD123";
+static const char* LEGO_SERVICE_UUID        = "00001623-1212-EFDE-1623-785FEABCD123";
+static const char* LEGO_CHARACTERISTIC_UUID = "00001624-1212-EFDE-1623-785FEABCD123";
+static const char* LEGO_HUB_NAME            = "Technic Move";
 
-static const char* LEGO_CHARACTERISTIC_UUID =
-  "00001624-1212-EFDE-1623-785FEABCD123";
-
-NimBLEClient* legoClient = nullptr;
+NimBLEClient*               legoClient         = nullptr;
 NimBLERemoteCharacteristic* legoCharacteristic = nullptr;
 
-bool legoConnected = false;
+NimBLEAddress  hubAddress;
+volatile bool  hubAddressKnown = false;
+volatile bool  legoConnected   = false;   // BLE callback'inden de yazılır
 
 // ============================================================
-// STATE
+// DURUM
 // ============================================================
 
-bool armed = false;
-bool lightsOn = true;
+bool     armed           = false;
+bool     lightsOn        = true;
+uint32_t brakeUntil      = 0;
+uint32_t lastReconnectMs = 0;
+uint32_t lastOledMs      = 0;
 
-int lastSpeed = 0;
-int lastSteering = 0;
-uint8_t lastLights = 0;
+// Gönderim takibi
+int      sentSpeed    = INT_MIN;
+int      sentSteering = INT_MIN;
+int      sentLights   = INT_MIN;
+uint32_t lastSendMs   = 0;
+
+// Ekran için son komut
+int curThrottle = 0;
+int curSteering = 0;
 
 // ============================================================
-// OLED
+// YARDIMCILAR
 // ============================================================
 
-void oledMessage(const char* line1,
-                 const char* line2 = "",
-                 const char* line3 = "") {
+struct EdgeButton {
+  bool prev = false;
+  bool rose(bool now) {
+    bool r = now && !prev;
+    prev = now;
+    return r;
+  }
+  void reset() { prev = false; }
+};
+
+EdgeButton btnA, btnB, btnStart;
+
+// 0..65535 (merkez ~32768) -> -100..100, ölü bölge + yeniden ölçekleme
+int axisToPercent(uint16_t raw, bool invert) {
+  long centered = (long)raw - 32768L;
+  int p = (int)(centered * 100L / 32768L);
+  p = constrain(p, -100, 100);
+  if (invert) p = -p;
+
+  int a = abs(p);
+  if (a < DEADZONE) return 0;
+
+  int scaled = map(a, DEADZONE, 100, 0, 100);
+  return p > 0 ? scaled : -scaled;
+}
+
+void forceResend() {
+  sentSpeed = sentSteering = sentLights = INT_MIN;
+}
+
+void oledMessage(const char* l1, const char* l2 = "", const char* l3 = "", const char* l4 = "") {
   oled.clearBuffer();
-
   oled.setFont(u8g2_font_6x10_tf);
-
-  oled.drawStr(0, 10, line1);
-  oled.drawStr(0, 22, line2);
-  oled.drawStr(0, 34, line3);
-
+  oled.drawStr(0, 9,  l1);
+  oled.drawStr(0, 19, l2);
+  oled.drawStr(0, 29, l3);
+  oled.drawStr(0, 39, l4);
   oled.sendBuffer();
 }
 
 // ============================================================
-// LEGO SEND
+// BLE CALLBACK'LERİ
 // ============================================================
 
-bool legoSend(const uint8_t* data, size_t length) {
-  if (!legoConnected || legoCharacteristic == nullptr) {
-    return false;
-  }
-
-  return legoCharacteristic->writeValue(
-    data,
-    length,
-    false);
-}
-
-// ============================================================
-// LEGO DRIVE
-//
-// LEGO 88019 combined drive frame:
-//
-// 0D 00 81 36 11 51 00 03 00
-// speed
-// steering
-// lights
-// 00
-// ============================================================
-
-void legoDrive(
-  int speed,
-  int steering,
-  uint8_t lights) {
-  speed = constrain(speed, -100, 100);
-  steering = constrain(steering, -100, 100);
-
-  uint8_t packet[13];
-
-  packet[0] = 0x0D;
-  packet[1] = 0x00;
-  packet[2] = 0x81;
-  packet[3] = 0x36;
-  packet[4] = 0x11;
-  packet[5] = 0x51;
-  packet[6] = 0x00;
-  packet[7] = 0x03;
-  packet[8] = 0x00;
-
-  packet[9] = (uint8_t)(int8_t)speed;
-  packet[10] = (uint8_t)(int8_t)steering;
-  packet[11] = lights;
-  packet[12] = 0x00;
-
-  legoSend(packet, sizeof(packet));
-}
-
-// ============================================================
-// STEERING CALIBRATION
-// ============================================================
-
-void legoCalibrateSteering() {
-  uint8_t packet1[] = {
-    0x0D, 0x00, 0x81, 0x36,
-    0x11, 0x51, 0x00, 0x03,
-    0x00, 0x00, 0x00, 0x10,
-    0x00
-  };
-
-  uint8_t packet2[] = {
-    0x0D, 0x00, 0x81, 0x36,
-    0x11, 0x51, 0x00, 0x03,
-    0x00, 0x00, 0x00, 0x08,
-    0x00
-  };
-
-  legoSend(packet1, sizeof(packet1));
-
-  delay(100);
-
-  legoSend(packet2, sizeof(packet2));
-
-  delay(100);
-}
-
-// ============================================================
-// LEGO SCAN
-// ============================================================
-
-// Adresi tarama callback'i içinde yakalıyoruz. Böylece getResults()
-// listesinden gelen cihaz nesnesine bağımlı kalmıyoruz.
-NimBLEAddress foundHubAddress;
-bool hubAddressFound = false;
-
-class LegoAdvertisedCallbacks : public NimBLEScanCallbacks {
+class LegoScanCallbacks : public NimBLEScanCallbacks {
 public:
-  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-    if (advertisedDevice == nullptr) {
-      return;
-    }
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    if (dev == nullptr || hubAddressKnown) return;
 
-    String name = advertisedDevice->haveName()
-                    ? String(advertisedDevice->getName().c_str())
-                    : String("");
-    bool nameMatches = name.indexOf("Technic Move") >= 0;
-    bool serviceMatches = advertisedDevice->isAdvertisingService(
-      NimBLEUUID(LEGO_SERVICE_UUID));
+    bool nameMatch = dev->haveName() &&
+                     dev->getName().find(LEGO_HUB_NAME) != std::string::npos;
+    bool svcMatch  = dev->isAdvertisingService(NimBLEUUID(LEGO_SERVICE_UUID));
 
-    Serial.print("BLE device: ");
-    Serial.print(name.length() ? name : String("<no name>"));
-    Serial.print(" | Address: ");
-    Serial.print(advertisedDevice->getAddress().toString().c_str());
-    Serial.print(" | LEGO service 0x1623: ");
-    Serial.println(serviceMatches ? "yes" : "no");
+#if DEBUG_BLE
+    Serial.printf("BLE: %s | %s | 0x1623:%s\n",
+                  dev->haveName() ? dev->getName().c_str() : "<isimsiz>",
+                  dev->getAddress().toString().c_str(),
+                  svcMatch ? "evet" : "hayir");
+#endif
 
-    // Hub is identified by its advertised name OR LEGO Powered Up service.
-    if (hubAddressFound || (!nameMatches && !serviceMatches)) {
-      return;
-    }
+    if (!nameMatch && !svcMatch) return;
 
-    Serial.println("LEGO HUB FOUND!");
-    foundHubAddress = advertisedDevice->getAddress();
-    hubAddressFound = true;
-
-    Serial.print("Address captured in callback: ");
-    Serial.println(foundHubAddress.toString().c_str());
-
+    hubAddress      = dev->getAddress();
+    hubAddressKnown = true;
+    Serial.printf("LEGO hub bulundu: %s\n", hubAddress.toString().c_str());
     NimBLEDevice::getScan()->stop();
   }
 };
 
-LegoAdvertisedCallbacks legoScanCallbacks;
+class LegoClientCallbacks : public NimBLEClientCallbacks {
+public:
+  void onDisconnect(NimBLEClient* client, int reason) override {
+    // Sadece bayrak: client burada silinmez, loop() yeniden bağlanır.
+    legoConnected = false;
+    Serial.printf("LEGO hub baglantisi koptu (reason=%d)\n", reason);
+  }
+};
+
+LegoScanCallbacks   legoScanCallbacks;
+LegoClientCallbacks legoClientCallbacks;
 
 // ============================================================
-// TRY A BLE ADDRESS AND VERIFY IT IS THE LEGO HUB
+// LEGO KOMUTLARI
 // ============================================================
 
-bool tryConnectAndVerifyLego(const NimBLEAddress& address) {
-  Serial.print("Trying BLE address: ");
-  Serial.println(address.toString().c_str());
+bool legoSend(const uint8_t* data, size_t length) {
+  if (!legoConnected || legoCharacteristic == nullptr) return false;
+  return legoCharacteristic->writeValue(data, length, false);
+}
 
-  legoClient = NimBLEDevice::createClient();
-  if (legoClient == nullptr) {
-    Serial.println("Could not create BLE client");
-    return false;
-  }
+// Birleşik sürüş çerçevesi:
+// 0D 00 81 36 11 51 00 03 00 [hız] [direksiyon] [ışık] 00
+bool legoDrive(int speed, int steering, uint8_t lights) {
+  speed    = constrain(speed, -100, 100);
+  steering = constrain(steering, -100, 100);
 
-  if (!legoClient->connect(address)) {
-    Serial.println("Connection attempt failed");
-    NimBLEDevice::deleteClient(legoClient);
-    legoClient = nullptr;
-    return false;
-  }
+  uint8_t packet[13] = {
+    0x0D, 0x00, 0x81, 0x36, 0x11, 0x51, 0x00, 0x03, 0x00,
+    (uint8_t)(int8_t)speed,
+    (uint8_t)(int8_t)steering,
+    lights,
+    0x00
+  };
+  return legoSend(packet, sizeof(packet));
+}
 
-  Serial.println("Connected; checking LEGO service 0x1623...");
-  NimBLERemoteService* testService = legoClient->getService(LEGO_SERVICE_UUID);
-  if (testService == nullptr) {
-    Serial.println("Connected device does not expose LEGO service; trying next address");
-    legoClient->disconnect();
-    NimBLEDevice::deleteClient(legoClient);
-    legoClient = nullptr;
-    return false;
-  }
-
-  Serial.println("LEGO service confirmed at this address");
-  return true;
+void legoCalibrateSteering() {
+  const uint8_t p1[] = { 0x0D, 0x00, 0x81, 0x36, 0x11, 0x51, 0x00, 0x03,
+                         0x00, 0x00, 0x00, 0x10, 0x00 };
+  const uint8_t p2[] = { 0x0D, 0x00, 0x81, 0x36, 0x11, 0x51, 0x00, 0x03,
+                         0x00, 0x00, 0x00, 0x08, 0x00 };
+  legoSend(p1, sizeof(p1));
+  delay(100);
+  legoSend(p2, sizeof(p2));
+  delay(100);
 }
 
 // ============================================================
-// LEGO CONNECT
+// LEGO TARAMA / BAĞLANTI
 // ============================================================
 
-bool connectToLego() {
-  cleanupLegoClient();
-
-  // Önceki denemeden kalmış tarama durumu/adresi sıfırla.
-  hubAddressFound = false;
-  foundHubAddress = NimBLEAddress();
-
-  Serial.println();
-  Serial.println("Scanning for LEGO hub...");
+// Sadece setup()'ta, Xbox kütüphanesi başlamadan önce kullanılır.
+bool scanForHub() {
+  hubAddressKnown = false;
 
   NimBLEScan* scan = NimBLEDevice::getScan();
-  if (scan == nullptr) {
-    Serial.println("ERROR: BLE scanner is null");
-    oledMessage("LEGO", "SCAN ERROR");
-    return false;
-  }
-
+  scan->setScanCallbacks(&legoScanCallbacks, false);
   scan->setActiveScan(true);
   scan->setInterval(45);
-  scan->setWindow(15);
-  scan->setScanCallbacks(&legoScanCallbacks, false);
+  scan->setWindow(30);
   scan->clearResults();
 
-  Serial.println("Starting callback-based BLE scan...");
-  if (!scan->start(10, false)) {
-    Serial.println("ERROR: Could not start BLE scan");
-    oledMessage("LEGO", "SCAN START FAIL");
+  Serial.println("LEGO hub taraniyor...");
+  if (!scan->start(SCAN_DURATION_MS, false)) {   // NimBLE 2.x: milisaniye
+    Serial.println("HATA: tarama baslatilamadi");
     return false;
   }
-
-  // onResult() stops scanning as soon as the target hub is found.
-  while (scan->isScanning()) {
-    delay(20);
-  }
-
+  while (scan->isScanning()) delay(20);
   scan->clearResults();
-  Serial.println("BLE scan finished.");
 
-  if (!hubAddressFound) {
-    Serial.println("LEGO hub not seen in this scan; will still try stored bonds.");
+  // Callback'i bırak; Xbox kütüphanesi kendi callback'ini kuracak.
+  scan->setScanCallbacks(nullptr);
+
+  return hubAddressKnown;
+}
+
+void dropLegoLink() {
+  legoConnected      = false;
+  legoCharacteristic = nullptr;
+  if (legoClient != nullptr && legoClient->isConnected()) {
+    legoClient->disconnect();
   }
+}
 
-  bool connectedToLego = false;
+bool connectToHub() {
+  if (!hubAddressKnown) return false;
 
-  std::string addressText = foundHubAddress.toString();
-  Serial.print("Advertised LEGO address: ");
-  Serial.println(addressText.c_str());
-
-  // Normal path: connect directly when a scan result supplied a valid address.
-  if (hubAddressFound && addressText != "00:00:00:00:00:00") {
-    connectedToLego = tryConnectAndVerifyLego(foundHubAddress);
-  } else {
-    Serial.println("Advertised address is zero; trying stored BLE bonds instead.");
-  }
-
-  // Some Technic Move hubs advertise a zero address. In that case, try each
-  // stored bond and identify the LEGO hub by its Powered Up service UUID.
-  if (!connectedToLego) {
-    int bondCount = NimBLEDevice::getNumBonds();
-    Serial.print("Stored bonds available for fallback: ");
-    Serial.println(bondCount);
-
-    for (int i = 0; i < bondCount; ++i) {
-      NimBLEAddress bondedAddress = NimBLEDevice::getBondedAddress(i);
-      Serial.print("Testing bond ");
-      Serial.print(i);
-      Serial.print(" at ");
-      Serial.println(bondedAddress.toString().c_str());
-
-      if (bondedAddress.toString() == "00:00:00:00:00:00") {
-        Serial.println("Skipping zero bond address");
-        continue;
-      }
-
-      if (tryConnectAndVerifyLego(bondedAddress)) {
-        connectedToLego = true;
-        break;
-      }
+  if (legoClient == nullptr) {
+    legoClient = NimBLEDevice::createClient();
+    if (legoClient == nullptr) {
+      Serial.println("HATA: BLE client olusturulamadi");
+      return false;
     }
+    legoClient->setClientCallbacks(&legoClientCallbacks, false);
+    legoClient->setConnectTimeout(CONNECT_TIMEOUT_MS);   // NimBLE 2.x: milisaniye
   }
 
-  if (!connectedToLego) {
-    Serial.println("Could not connect to LEGO hub using scan or stored bonds.");
-    oledMessage("LEGO", "CONNECT FAIL");
-    cleanupLegoClient();
+  Serial.printf("LEGO hub'a baglaniliyor: %s\n", hubAddress.toString().c_str());
+  if (!legoClient->connect(hubAddress)) {
+    Serial.println("Baglanti basarisiz");
     return false;
   }
 
-  Serial.println("LEGO connected and service verified");
-
-  NimBLEDevice::setSecurityAuth(
-    true,   // Bonding
-    false,  // MITM
-    false   // Secure Connections
-  );
-
-  Serial.println("Establishing security...");
-  if (!legoClient->secureConnection()) {
-    Serial.println("LEGO secure connection failed");
-    cleanupLegoClient();
+  if (USE_SECURE_CONNECTION && !legoClient->secureConnection()) {
+    Serial.println("Guvenli baglanti basarisiz");
+    dropLegoLink();
     return false;
   }
 
-  Serial.println("LEGO security established");
-  Serial.println("Discovering LEGO service...");
-
-  NimBLERemoteService* service =
-    legoClient->getService(LEGO_SERVICE_UUID);
-
+  NimBLERemoteService* service = legoClient->getService(LEGO_SERVICE_UUID);
   if (service == nullptr) {
-    Serial.println("LEGO service not found");
-    cleanupLegoClient();
+    Serial.println("LEGO servisi bulunamadi");
+    dropLegoLink();
     return false;
   }
 
-  Serial.println("Discovering LEGO characteristic...");
-  legoCharacteristic =
-    service->getCharacteristic(LEGO_CHARACTERISTIC_UUID);
-
+  legoCharacteristic = service->getCharacteristic(LEGO_CHARACTERISTIC_UUID);
   if (legoCharacteristic == nullptr) {
-    Serial.println("LEGO characteristic not found");
-    cleanupLegoClient();
+    Serial.println("LEGO karakteristigi bulunamadi");
+    dropLegoLink();
     return false;
   }
 
   legoConnected = true;
-  Serial.println("LEGO HUB READY!");
+  Serial.println("LEGO HUB HAZIR");
 
-  oledMessage("LEGO CONNECTED", "Calibrating...");
+  oledMessage("LEGO BAGLI", "Kalibrasyon...");
   delay(300);
   legoCalibrateSteering();
 
-  oledMessage("LEGO READY", "Press START");
+  forceResend();
   return true;
 }
 
-void cleanupLegoClient()
-{
-    legoConnected = false;
-    legoCharacteristic = nullptr;
+// ============================================================
+// ARM / DISARM
+// ============================================================
 
-    if (legoClient != nullptr)
-    {
-        if (legoClient->isConnected())
-        {
-            legoClient->disconnect();
-        }
+void disarm(bool brake) {
+  if (armed) Serial.println("DISARMED");
+  armed = false;
+  if (brake) brakeUntil = millis() + BRAKE_LIGHT_MS;
+  forceResend();
+}
 
-        NimBLEDevice::deleteClient(legoClient);
-        legoClient = nullptr;
-    }
+// ============================================================
+// KOMUT GÖNDERİMİ (değişince + periyodik keepalive)
+// ============================================================
 
+void sendDriveIfNeeded(int speed, int steering, uint8_t lights, uint32_t now) {
+  if (!legoConnected) return;
+
+  bool changed = speed != sentSpeed || steering != sentSteering || (int)lights != sentLights;
+  if (!changed && (now - lastSendMs) < KEEPALIVE_MS) return;
+
+  if (legoDrive(speed, steering, lights)) {
+    sentSpeed    = speed;
+    sentSteering = steering;
+    sentLights   = lights;
+  } else {
+    forceResend();   // bir sonraki döngüde tekrar dene
+  }
+  lastSendMs = now;
+}
+
+// ============================================================
+// OLED DURUM EKRANI
+// ============================================================
+
+void updateOled(bool xboxOk, uint32_t now) {
+  if (now - lastOledMs < OLED_INTERVAL_MS) return;
+  lastOledMs = now;
+
+  const char* status;
+  if (!legoConnected)       status = "LEGO YOK";
+  else if (!xboxOk)         status = "XBOX BEKLE";
+  else if (now < brakeUntil) status = "ACIL STOP";
+  else if (armed)           status = "ARMED";
+  else                      status = "START'a bas";
+
+  char l2[16], l3[16];
+  snprintf(l2, sizeof(l2), "SPD:%4d", curThrottle);
+  snprintf(l3, sizeof(l3), "STR:%4d", curSteering);
+
+  oledMessage(status, l2, l3, lightsOn ? "ISIK ACIK" : "ISIK KAPALI");
 }
 
 // ============================================================
@@ -394,54 +367,40 @@ void cleanupLegoClient()
 
 void setup() {
   Serial.begin(115200);
-
-  delay(1000);
+  delay(500);
 
   oled.begin();
   oled.setContrast(255);
-
-  oledMessage(
-    "ESP32-C3",
-    "Xbox + LEGO",
-    "Starting...");
+  oledMessage("ESP32-C3", "Xbox + LEGO", "Basliyor...");
 
   Serial.println();
-  Serial.println("======================");
-  Serial.println("ESP32 LEGO CONTROLLER");
-  Serial.println("======================");
+  Serial.println("=== ESP32 LEGO CONTROLLER ===");
 
-  // --------------------------------------------------------
-  // BLE
-  // --------------------------------------------------------
+  NimBLEDevice::init("ESP32-C3-LEGO");
+  // Not: Xbox kütüphanesi begin() içinde kendi güvenlik ayarlarını
+  // yapabilir; bu ayar global'dir.
+  NimBLEDevice::setSecurityAuth(true, false, false);
 
-  NimBLEDevice::init(
-    "ESP32-C3-LEGO");
-
-  Serial.println("=== BLE BOND DIAGNOSTICS ===");
-  int startupBondCount = NimBLEDevice::getNumBonds();
-  Serial.print("Stored bonds: ");
-  Serial.println(startupBondCount);
-  for (int i = 0; i < startupBondCount; ++i) {
-    NimBLEAddress bondAddress = NimBLEDevice::getBondedAddress(i);
-    Serial.print("Bond ");
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.println(bondAddress.toString().c_str());
+  // 1) LEGO hub'ı bul (Xbox başlamadan önce, scanner çakışması olmasın)
+  int attempt = 0;
+  while (!hubAddressKnown) {
+    attempt++;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Deneme %d", attempt);
+    oledMessage("LEGO ARANIYOR", "Hub'i acin", buf);
+    if (!scanForHub()) {
+      Serial.println("Hub bulunamadi, tekrar deneniyor...");
+      delay(500);
+    }
   }
-  Serial.println("============================");
 
-  // --------------------------------------------------------
-  // Xbox
-  // --------------------------------------------------------
+  // 2) Bağlan (başarısız olursa loop() yeniden dener)
+  connectToHub();
+  lastReconnectMs = millis();
 
+  // 3) Xbox kumanda
   xboxController.begin();
-
-  Serial.println(
-    "Xbox controller waiting...");
-
-  oledMessage(
-    "WAITING",
-    "XBOX CONTROLLER");
+  Serial.println("Xbox kumanda bekleniyor...");
 }
 
 // ============================================================
@@ -449,222 +408,83 @@ void setup() {
 // ============================================================
 
 void loop() {
-  // --------------------------------------------------------
-  // Xbox update
-  // --------------------------------------------------------
+  uint32_t now = millis();
 
   xboxController.onLoop();
 
-  // --------------------------------------------------------
-  // Xbox connection
-  // --------------------------------------------------------
-
-  if (!xboxController.isConnected()) {
-    armed = false;
-
-    if (legoConnected) {
-      legoDrive(
-        0,
-        0,
-        0x01);
-    }
-
-    oledMessage(
-      "WAITING",
-      "XBOX...");
-
-    delay(50);
-
-    return;
-  }
-
-  // --------------------------------------------------------
-  // LEGO connection
-  // --------------------------------------------------------
-
+  // ---------- LEGO bağlantı bakımı ----------
   if (!legoConnected) {
-    connectToLego();
-
-    delay(100);
-
-    return;
-  }
-
-  // --------------------------------------------------------
-  // Emergency stop - B
-  // --------------------------------------------------------
-
-  if (xboxController.xboxNotif.btnB) {
-    armed = false;
-
-    legoDrive(
-      0,
-      0,
-      0x01);
-
-    oledMessage(
-      "EMERGENCY STOP",
-      "Press START");
-
-    delay(150);
-
-    return;
-  }
-
-  // --------------------------------------------------------
-  // ARM
-  // --------------------------------------------------------
-
-  if (xboxController.xboxNotif.btnStart) {
-    if (!armed) {
-      armed = true;
-
-      Serial.println(
-        "SYSTEM ARMED");
-
-      oledMessage(
-        "READY",
-        "ARMED");
-
-      delay(250);
+    if (armed) disarm(false);
+    if (now - lastReconnectMs >= RECONNECT_INTERVAL_MS) {
+      lastReconnectMs = now;
+      oledMessage("LEGO YOK", "Yeniden", "baglaniyor...");
+      connectToHub();          // en fazla CONNECT_TIMEOUT_MS bloklar
+      now = millis();
     }
   }
 
-  // --------------------------------------------------------
-  // LIGHTS
-  // --------------------------------------------------------
+  // ---------- Xbox girişleri ----------
+  bool xboxOk = xboxController.isConnected();
+  int throttle = 0;
+  int steering = 0;
 
-  if (xboxController.xboxNotif.btnA) {
-    lightsOn = !lightsOn;
+  if (!xboxOk) {
+    if (armed) {
+      Serial.println("Xbox koptu -> stop");
+      disarm(true);
+    }
+    btnA.reset(); btnB.reset(); btnStart.reset();
+  } else {
+    const auto& n = xboxController.xboxNotif;
 
-    Serial.print(
-      "Lights: ");
+    throttle = axisToPercent(n.joyLVert, INVERT_THROTTLE);
+    steering = axisToPercent(n.joyLHori, INVERT_STEERING);
 
-    Serial.println(
-      lightsOn ? "ON" : "OFF");
+    bool bHeld = n.btnB;
+    bool bEdge = btnB.rose(bHeld);
+    bool startEdge = btnStart.rose(n.btnStart);
+    bool aEdge = btnA.rose(n.btnA);
 
-    delay(250);
+    // Acil stop: B basılı tutulduğu sürece arm edilemez
+    if (bEdge) {
+      Serial.println("ACIL STOP");
+      disarm(true);
+    }
+
+    // Arm: B basılı değilken, hub bağlıyken ve gaz ortadayken
+    if (startEdge && !bHeld && legoConnected && !armed) {
+      if (throttle == 0) {
+        armed = true;
+        brakeUntil = 0;
+        forceResend();
+        Serial.println("ARMED");
+      } else {
+        Serial.println("Arm reddedildi: once gazi ortala");
+      }
+    }
+
+    if (aEdge) {
+      lightsOn = !lightsOn;
+      Serial.printf("Isiklar: %s\n", lightsOn ? "ACIK" : "KAPALI");
+    }
   }
 
-  // --------------------------------------------------------
-  // NOT ARMED
-  // --------------------------------------------------------
-
+  // ---------- Komut ----------
   if (!armed) {
-    legoDrive(
-      0,
-      0,
-      lightsOn ? 0x00 : 0x04);
-
-    delay(20);
-
-    return;
-  }
-
-  // --------------------------------------------------------
-  // READ JOYSTICK
-  // --------------------------------------------------------
-
-  int steering =
-    xboxController.xboxNotif.joyLHori;
-
-  int throttle =
-    xboxController.xboxNotif.joyLVert;
-
-  // Depending on the library/controller
-  // Y may have opposite orientation.
-  //
-  // Normalize to -100..100.
-
-  throttle =
-    constrain(
-      throttle,
-      -100,
-      100);
-
-  steering =
-    constrain(
-      steering,
-      -100,
-      100);
-
-  // --------------------------------------------------------
-  // DEADZONE
-  // --------------------------------------------------------
-
-  if (abs(throttle) < 8)
     throttle = 0;
-
-  if (abs(steering) < 8)
     steering = 0;
-
-  // --------------------------------------------------------
-  // SEND ONLY WHEN CHANGED
-  // --------------------------------------------------------
-
-  if (throttle != lastSpeed || steering != lastSteering || lightsOn != (lastLights == 0x00)) {
-    uint8_t lights =
-      lightsOn ? 0x00 : 0x04;
-
-    legoDrive(
-      throttle,
-      steering,
-      lights);
-
-    lastSpeed =
-      throttle;
-
-    lastSteering =
-      steering;
-
-    lastLights =
-      lights;
   }
 
-  // --------------------------------------------------------
-  // OLED
-  // --------------------------------------------------------
+  uint8_t lights = (now < brakeUntil) ? LIGHTS_BRAKE
+                                      : (lightsOn ? LIGHTS_ON : LIGHTS_OFF);
 
-  oled.clearBuffer();
+  curThrottle = throttle;
+  curSteering = steering;
 
-  oled.setFont(
-    u8g2_font_6x10_tf);
+  sendDriveIfNeeded(throttle, steering, lights, now);
 
-  oled.drawStr(
-    0,
-    9,
-    "LEGO READY");
+  // ---------- Ekran ----------
+  updateOled(xboxOk, now);
 
-  char buffer[20];
-
-  snprintf(
-    buffer,
-    sizeof(buffer),
-    "SPD:%4d",
-    throttle);
-
-  oled.drawStr(
-    0,
-    20,
-    buffer);
-
-  snprintf(
-    buffer,
-    sizeof(buffer),
-    "STR:%4d",
-    steering);
-
-  oled.drawStr(
-    0,
-    31,
-    buffer);
-
-  oled.drawStr(
-    0,
-    40,
-    lightsOn ? "LIGHT ON" : "LIGHT OFF");
-
-  oled.sendBuffer();
-
-  delay(20);
+  delay(10);
 }
